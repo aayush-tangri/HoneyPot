@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/bin/python -c \"import sklearn; print\\(''sklearn ok''\\)\")",
+      "Bash(venv/bin/python -c \"import numpy; print\\(''numpy ok''\\)\")",
+      "Bash(python -c \"import sklearn; print\\(''sklearn ok''\\)\")",
+      "Bash(python -c \"import numpy; print\\(''numpy ok''\\)\")",
+      "Bash(python:*)"
+    ]
+  }
+}

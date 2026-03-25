@@ -12,6 +12,10 @@ import random
 import sys
 import os
 
+# Fix Unicode output on Windows terminals
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 # Make sure Python can find the app module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
 async def append_jsonl(path: str, event: Dict[str, Any]) -> None:

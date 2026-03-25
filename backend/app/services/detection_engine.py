@@ -6,7 +6,7 @@ import re
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 
@@ -17,14 +17,14 @@ AttackerClassification = str  # "Scanner" | "Brute-forcer" | "Manual Attacker"
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now()
 
 
 def _parse_ts(s: Optional[str]) -> datetime:
     if not s:
         return _utc_now()
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
     except Exception:
         return _utc_now()
 
@@ -296,11 +296,25 @@ class DetectionEngine:
         st: AttackerState,
         e: Dict[str, Any],
         attack_type: AttackType,
-        source: str = "rule",         # NEW: "rule" or "ml"
-        confidence: float = 1.0,      # NEW: ML confidence (1.0 for rules)
+        source: str = "rule",         # "rule" or "ml"
+        confidence: float = 1.0,      # ML confidence (1.0 for rules)
     ) -> None:
         st.behavior_counts[attack_type] += 1
         risk = _risk_level(st.risk_score)
+
+        # ── Live terminal alert ────────────────────────────────────────────────
+        try:
+            from app.core.terminal import print_attack
+            print_attack(
+                ip=st.ip,
+                attack_type=attack_type,
+                endpoint=str(e.get("endpoint", "")),
+                risk=risk,
+                source=source,
+                conf=confidence if source == "ml" else None,
+            )
+        except Exception:
+            pass
 
         ts = _parse_ts(e.get("timestamp")).timestamp()
         st.recent_attack_types.append((ts, attack_type))

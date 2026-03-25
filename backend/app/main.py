@@ -4,13 +4,14 @@ import os
 import time
 import uuid
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, File, Form, Request, UploadFile, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.log_writer import append_jsonl
+from app.core.terminal import _c, print_request, print_attack
 from app.services.detection_engine import DetectionEngine
 
 
@@ -21,6 +22,14 @@ UPLOAD_DIR = os.path.join(BACKEND_ROOT, "uploads")
 
 # In-memory behavior engine (rule-first).
 ENGINE = DetectionEngine()
+
+# ── Startup banner ─────────────────────────────────────────────────────────────
+print(_c("\n╔══════════════════════════════════════════════════════╗", "1;96"))
+print(_c("║        HoneyGuard — Honeypot Backend Running        ║", "1;96"))
+print(_c("╚══════════════════════════════════════════════════════╝", "1;96"))
+ml_status = _c("✓ ML classifier ready (Random Forest)", "92") if ENGINE._classifier_ready else _c("✗ ML unavailable — rules only", "93")
+print(f"  {ml_status}")
+print(_c("  Listening for attacks...\n", "90"))
 
 
 app = FastAPI(
@@ -87,6 +96,10 @@ async def structured_request_logger(request: Request, call_next):
             "request_id": request_id,
         }
 
+        # ── Print every request to terminal ───────────────────────────────────
+        if request.url.path not in ("/health", "/favicon.ico"):
+            print_request(ip, request.method, str(request.url.path), status_code, duration_ms)
+
         try:
             await append_jsonl(LOG_PATH, event)
         except Exception:
@@ -96,7 +109,7 @@ async def structured_request_logger(request: Request, call_next):
         # Also feed the in-memory detector immediately (so UI updates without waiting).
         try:
             # Ensure timestamp is present for rule windows.
-            event["timestamp"] = datetime.now(timezone.utc).isoformat()
+            event["timestamp"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             ENGINE.process_request_event(event)
         except Exception:
             pass
