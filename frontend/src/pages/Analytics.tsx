@@ -20,7 +20,13 @@ const Analytics = () => {
         setVolumeData(data.hourlyAttackVolume || []);
         setTopEndpoints(data.topEndpoints || []);
       } catch {
-        // keep UI stable if backend is down
+        if (!cancelled) {
+          const { generateMockAttacks, getAttackTypeDistribution, getTopEndpoints, getHourlyAttackVolume } = await import('@/data/mockData');
+          const mock = generateMockAttacks(100);
+          setAttackTypeData(getAttackTypeDistribution(mock));
+          setTopEndpoints(getTopEndpoints(mock));
+          setVolumeData(getHourlyAttackVolume(mock));
+        }
       }
     };
     void load();

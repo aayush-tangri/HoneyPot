@@ -58,20 +58,19 @@ class AttackerState:
     endpoint_counts: Counter = field(default_factory=Counter)
 
     risk_score: int = 10
-    # Behavior counters for explainability / classification.
-    behavior_counts: Counter = field(default_factory=Counter)  # keys: AttackType
+    behavior_counts: Counter = field(default_factory=Counter)
     recon_hits: int = 0
     brute_force_emits: int = 0
-    # Recent emitted attack types for classification (ts_s, attackType)
     recent_attack_types: Deque[Tuple[float, str]] = field(default_factory=lambda: deque(maxlen=2000))
 
 
 class DetectionEngine:
     """
-    Rule-first behavior detector.
+    Rule-first behavior detector with ML classifier fallback.
 
-    It processes structured request events (from requests.jsonl) and emits
-    "attack events" the frontend can display.
+    Rules run first — they are fast and explainable.
+    If a request doesn't match any rule, the ML classifier
+    gets a chance to label it based on the full feature vector.
     """
 
     def __init__(self) -> None:
@@ -80,13 +79,33 @@ class DetectionEngine:
         self._file_pos: int = 0
         self._last_tail_ts: float = 0.0
 
+        # ── ML classifier (lazy init so startup never blocks) ──────────────
+        self._classifier = None
+        self._classifier_ready = False
+        self._init_classifier()
+
+    def _init_classifier(self) -> None:
+        """
+        Train the ML classifier at startup.
+        Wrapped in try/except so if scikit-learn is missing,
+        the honeypot still works using rules only.
+        """
+        try:
+            from app.services.attack_classifier import AttackClassifier
+            self._classifier = AttackClassifier()
+            self._classifier_ready = True
+        except Exception as e:
+            # Graceful degradation: rules still work without ML.
+            print(f"[DetectionEngine] ML classifier unavailable: {e}")
+            self._classifier_ready = False
+
     # -------------------------
     # Public API used by routes
     # -------------------------
 
     def get_recent_attacks(self, limit: int = 50) -> List[Dict[str, Any]]:
         items = list(self._attack_events)
-        return list(reversed(items[-max(1, limit) :]))
+        return list(reversed(items[-max(1, limit):]))
 
     def get_attacker_profile(self, ip: str) -> Dict[str, Any]:
         st = self._attackers.get(ip)
@@ -156,10 +175,6 @@ class DetectionEngine:
     # -------------------------
 
     def tail_once(self, log_path: str) -> int:
-        """
-        Read and process any new JSONL lines since last position.
-        Returns number of processed lines.
-        """
         if not os.path.exists(log_path):
             return 0
 
@@ -199,32 +214,33 @@ class DetectionEngine:
         status = int(e.get("status_code") or 200)
         auth_success = e.get("auth_success", None)
 
-        # ---- Rules (behavior-first) ----
-        # Recon / traversal-ish endpoints (very common honeypot noise)
+        # ── Prune windows before reading lengths ──────────────────────────
+        self._prune_older_than(st.recent_requests_s, ts_s - 60)
+        self._prune_older_than(st.recent_failed_logins_s, ts_s - 60)
+
+        # ── RULES (always run first) ───────────────────────────────────────
+
+        # Rule 1: Recon / path traversal
         if endpoint in ("/.env", "/wp-admin/admin-ajax.php", "/wp-admin") or ".." in endpoint:
             st.recon_hits += 1
             self._recompute_risk(st, ts_s)
-            self._emit(st, e, attack_type="Path Traversal")
+            self._emit(st, e, attack_type="Path Traversal", source="rule")
             return
 
-        # Brute force: failed login tracking
+        # Rule 2: Brute force (failed login tracking)
         if endpoint == "/login" and auth_success is False:
             st.recent_failed_logins_s.append(ts_s)
-            # window: last 60 seconds
             self._prune_older_than(st.recent_failed_logins_s, ts_s - 60)
             self._recompute_risk(st, ts_s)
             if len(st.recent_failed_logins_s) >= 10:
-                # Only /login failures should be marked brute force.
-                # Reduce spam: emit every 3rd failed login after threshold.
                 st.brute_force_emits += 1
                 if st.brute_force_emits % 3 == 0:
-                    self._emit(st, e, attack_type="Brute Force")
+                    self._emit(st, e, attack_type="Brute Force", source="rule")
                 return
-            # still suspicious but lower
-            self._emit(st, e, attack_type="Credential Stuffing")
+            self._emit(st, e, attack_type="Credential Stuffing", source="rule")
             return
 
-        # IDOR enumeration: sequential user IDs
+        # Rule 3: IDOR enumeration
         m = _RE_USER_ID.match(endpoint)
         if m:
             user_id = int(m.group(1))
@@ -234,40 +250,61 @@ class DetectionEngine:
                 st.sequential_id_hits = 0
             st.last_user_id = user_id
             self._recompute_risk(st, ts_s)
-
-            # Mark IDOR as soon as we see a sequence starting (less confusing),
-            # but only after at least 2 steps to avoid false positives.
             if st.sequential_id_hits >= 1:
-                self._emit(st, e, attack_type="IDOR")
+                self._emit(st, e, attack_type="IDOR", source="rule")
                 return
 
-        # High-frequency API abuse: > 120 requests/min
-        self._prune_older_than(st.recent_requests_s, ts_s - 60)
+        # Rule 4: High-frequency API abuse
         self._recompute_risk(st, ts_s)
         if len(st.recent_requests_s) > 120:
-            self._emit(st, e, attack_type="API Abuse")
+            self._emit(st, e, attack_type="API Abuse", source="rule")
             return
 
-        # Default: scanner-ish if they’re probing many endpoints quickly
+        # ── ML CLASSIFIER (runs when no rule matched confidently) ─────────
+        # Builds the same feature vector attack_classifier.py expects.
+        if self._classifier_ready and self._classifier is not None:
+            features = {
+                "endpoint": endpoint,
+                "method": e.get("method", "GET"),
+                "status_code": status,
+                "payload_size": int(e.get("payload_size") or 0),
+                "requests_in_60s": len(st.recent_requests_s),
+                "failed_logins_60s": len(st.recent_failed_logins_s),
+                "sequential_id_hits": st.sequential_id_hits,
+            }
+            ml_label, confidence = self._classifier.classify(features)
+
+            if self._classifier.is_confident(confidence) and status >= 400:
+                # Only emit if the ML label is suspicious AND the request
+                # actually got an error response (reduces false positives).
+                self._emit(st, e, attack_type=ml_label, source="ml", confidence=confidence)
+                return
+
+        # ── Catch-all: plain 4xx with no rule or ML match ─────────────────
         if status >= 400:
-            # A single 404 shouldn't become HIGH risk. Keep it low.
-            self._emit(st, e, attack_type="Scanner")
+            self._emit(st, e, attack_type="Scanner", source="rule")
             return
 
-        # Non-malicious-looking requests are not emitted as "attacks" to reduce noise.
+        # Non-suspicious requests are not emitted (reduces noise).
 
     # -------------------------
     # Helpers
     # -------------------------
 
-    def _emit(self, st: AttackerState, e: Dict[str, Any], attack_type: AttackType) -> None:
+    def _emit(
+        self,
+        st: AttackerState,
+        e: Dict[str, Any],
+        attack_type: AttackType,
+        source: str = "rule",         # NEW: "rule" or "ml"
+        confidence: float = 1.0,      # NEW: ML confidence (1.0 for rules)
+    ) -> None:
         st.behavior_counts[attack_type] += 1
         risk = _risk_level(st.risk_score)
-        payload_preview: Optional[str] = None
 
         ts = _parse_ts(e.get("timestamp")).timestamp()
         st.recent_attack_types.append((ts, attack_type))
-        self._prune_recent_attack_types(st, ts - 600)  # keep last 10 minutes for classification
+        self._prune_recent_attack_types(st, ts - 600)
 
         self._attack_events.append(
             {
@@ -278,7 +315,9 @@ class DetectionEngine:
                 "attackType": attack_type,
                 "riskLevel": risk,
                 "userAgent": e.get("user_agent", ""),
-                "payload": payload_preview,
+                "payload": None,
+                "detectionSource": source,        # NEW: visible in frontend
+                "mlConfidence": round(confidence, 3) if source == "ml" else None,
             }
         )
 
@@ -287,11 +326,6 @@ class DetectionEngine:
             dq.popleft()
 
     def _recompute_risk(self, st: AttackerState, now_s: float) -> None:
-        """
-        Explainable risk score based on *recent* behavior (last ~60s),
-        instead of permanently accumulating to 100.
-        """
-        # Make sure windows are current.
         self._prune_older_than(st.recent_failed_logins_s, now_s - 60)
         self._prune_older_than(st.recent_requests_s, now_s - 60)
 
@@ -300,30 +334,23 @@ class DetectionEngine:
         seq = st.sequential_id_hits
 
         score = 10
-        # Keep scores realistic: 10 failed logins should push into HIGH, not instantly to 100.
-        score += min(40, failed_60s * 4)           # brute force pressure (cap 40)
-        score += min(24, seq * 6)                  # IDOR enumeration streak (cap 24)
-        score += min(20, max(0, rpm - 80) // 8)    # rate abuse only after 80 rpm
-        score += min(15, st.recon_hits * 3)        # recon/traversal indicators (cap 15)
+        score += min(40, failed_60s * 4)
+        score += min(24, seq * 6)
+        score += min(20, max(0, rpm - 80) // 8)
+        score += min(15, st.recon_hits * 3)
 
         st.risk_score = max(0, min(100, score))
 
     def _classify(self, st: AttackerState) -> AttackerClassification:
-        """
-        Explainable, rule-first classification based on RECENT (last 10 minutes) behavior.
-        This avoids "sticky" labels where one brute-force burst marks the IP forever.
-        """
         now_s = _utc_now().timestamp()
         self._prune_recent_attack_types(st, now_s - 600)
 
         counts = Counter(t for _, t in st.recent_attack_types)
-        # Count brute-force pressure from *requests*, not only emitted events (we throttle emits).
         brute = counts.get("Brute Force", 0) + counts.get("Credential Stuffing", 0)
         idor = counts.get("IDOR", 0)
         recon = counts.get("Path Traversal", 0) + counts.get("Scanner", 0)
         abuse = counts.get("API Abuse", 0)
 
-        # Dominant-pattern classification (simple + viva-friendly).
         if (len(st.recent_failed_logins_s) >= 10) or (brute >= 3 and brute >= max(idor, abuse, recon)):
             return "Brute-forcer"
         if idor >= 3 and idor >= max(brute, abuse, recon):
@@ -351,4 +378,3 @@ class DetectionEngine:
                 if len(out) >= limit:
                     break
         return list(reversed(out))
-

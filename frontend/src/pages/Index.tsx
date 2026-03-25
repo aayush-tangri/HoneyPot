@@ -25,7 +25,12 @@ const Index = () => {
         setAttacks(latest);
         setStats(getAttackStats(latest));
       } catch {
-        // If backend is down, keep UI stable (no hard crash).
+        if (!cancelled) {
+          const { generateMockAttacks, getAttackStats } = await import('@/data/mockData');
+          const mock = generateMockAttacks(50);
+          setAttacks(mock);
+          setStats(getAttackStats(mock));
+        }
       }
     };
 
