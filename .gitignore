@@ -1,0 +1,8 @@
+.claude/
+venv/
+__pycache__/
+*.pyc
+logs/
+uploads/
+node_modules/
+.env
